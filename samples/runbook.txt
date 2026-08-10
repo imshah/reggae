@@ -1,0 +1,6 @@
+Incident Runbook
+
+On-call receives a PagerDuty alert. The engineer acknowledges within 5 minutes,
+opens a war room, and checks the OrderService dashboard. If the database is the
+cause, failover to the replica. There is currently no documented rollback for a
+bad deployment.

@@ -1,0 +1,7 @@
+[tools]
+python = "3.13"
+node = "24"
+
+[env]
+# Auto-create and activate a project-local virtualenv on `cd` into the dir.
+_.python.venv = { path = ".venv", create = true }

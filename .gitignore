@@ -1,0 +1,10 @@
+.venv/
+.env
+.claude/
+__pycache__/
+*.pyc
+docmind/data/
+*.egg-info/
+build/
+dist/
+.DS_Store
