@@ -16,6 +16,9 @@ from docmind.config import Config
 TABLE = "chunks"
 
 
+DEFAULT_GROUP = "default"
+
+
 @dataclass
 class Chunk:
     chunk_id: str
@@ -27,6 +30,7 @@ class Chunk:
     page: int
     text: str
     vector: list[float]
+    group: str = DEFAULT_GROUP
 
 
 @dataclass
@@ -40,6 +44,7 @@ class Hit:
     page: int
     text: str
     score: float
+    group: str = DEFAULT_GROUP
 
 
 def _schema(dim: int) -> pa.Schema:
@@ -53,9 +58,15 @@ def _schema(dim: int) -> pa.Schema:
             pa.field("kind", pa.string()),
             pa.field("page", pa.int32()),
             pa.field("text", pa.string()),
+            pa.field("group", pa.string()),
             pa.field("vector", pa.list_(pa.float32(), dim)),
         ]
     )
+
+
+def _q(value: str) -> str:
+    """SQL-escape a string literal for a LanceDB predicate."""
+    return value.replace("'", "''")
 
 
 class VectorStore:
@@ -68,10 +79,23 @@ class VectorStore:
         self.db = lancedb.connect(str(LANCE_DIR))
         if TABLE in self.db.table_names():
             self.table = self.db.open_table(TABLE)
+            self._migrate_group_column()
         elif dim is not None:
             self.table = self.db.create_table(TABLE, schema=_schema(dim))
         else:
             self.table = None  # created lazily on first add()
+
+    def _migrate_group_column(self) -> None:
+        """Backfill a `group` column on tables created before grouping existed."""
+        try:
+            if "group" in self.table.schema.names:
+                return
+            # add_columns takes SQL expressions; a literal backfills every row
+            self.table.add_columns({"group": f"'{DEFAULT_GROUP}'"})
+        except Exception:
+            # older LanceDB without add_columns — group filters degrade to
+            # "no match"; a `docmind add --force` re-index restores full support
+            pass
 
     def _ensure_table(self, dim: int) -> None:
         if self.table is None:
@@ -92,6 +116,7 @@ class VectorStore:
                 "kind": c.kind,
                 "page": c.page,
                 "text": c.text,
+                "group": c.group,
                 "vector": c.vector,
             }
             for c in chunks
@@ -101,16 +126,30 @@ class VectorStore:
     def delete_doc(self, doc_id: str) -> None:
         if self.table is None:
             return
-        safe = doc_id.replace("'", "''")
-        self.table.delete(f"doc_id = '{safe}'")
+        self.table.delete(f"doc_id = '{_q(doc_id)}'")
 
-    def search(self, query_vec: list[float], top_k: int, kind: str | None = None) -> list[Hit]:
+    def search(
+        self,
+        query_vec: list[float],
+        top_k: int,
+        kind: str | None = None,
+        doc_ids: list[str] | None = None,
+    ) -> list[Hit]:
+        """doc_ids: restrict to these documents; None = no restriction;
+        empty list = no eligible docs (returns [])."""
         if self.table is None:
             return []
+        if doc_ids is not None and not doc_ids:
+            return []
         q = self.table.search(query_vec).limit(top_k)
+        clauses: list[str] = []
         if kind:
-            safe = kind.replace("'", "''")
-            q = q.where(f"kind = '{safe}'")
+            clauses.append(f"kind = '{_q(kind)}'")
+        if doc_ids:
+            ids = ", ".join(f"'{_q(d)}'" for d in doc_ids)
+            clauses.append(f"doc_id IN ({ids})")
+        if clauses:
+            q = q.where(" AND ".join(clauses))
         results = q.to_list()
         hits: list[Hit] = []
         for r in results:
@@ -127,14 +166,20 @@ class VectorStore:
                     page=int(r["page"]),
                     text=r["text"],
                     score=1.0 / (1.0 + dist),
+                    group=r.get("group", DEFAULT_GROUP),
                 )
             )
         return hits
 
-    def count(self) -> int:
+    def count(self, doc_ids: list[str] | None = None) -> int:
         if self.table is None:
             return 0
+        if doc_ids is not None and not doc_ids:
+            return 0
         try:
+            if doc_ids:
+                ids = ", ".join(f"'{_q(d)}'" for d in doc_ids)
+                return self.table.count_rows(f"doc_id IN ({ids})")
             return self.table.count_rows()
         except Exception:
             return 0

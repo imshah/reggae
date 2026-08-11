@@ -25,6 +25,11 @@ from docmind.store.vectordb import Hit, VectorStore
 Logger = Callable[[str], None]
 Confirmer = Callable[[str], bool]   # message -> proceed?
 
+# sentinel for retrieve(group=...): distinguishes "scope to the active group"
+# (default) from an explicit None ("search all groups").
+_ACTIVE = object()
+ALL_GROUPS = None
+
 
 class BudgetExceeded(Exception):
     pass
@@ -79,8 +84,10 @@ class Engine:
         return self._store
 
     # --- ingest -----------------------------------------------------------
-    def ingest_path(self, path: Path, log: Logger, force: bool = False) -> list[IngestResult]:
+    def ingest_path(self, path: Path, log: Logger, force: bool = False,
+                    groups: list[str] | None = None) -> list[IngestResult]:
         path = path.expanduser()
+        grps = list(groups) if groups else [self.cfg.active_group]
         targets: list[Path] = []
         if path.is_dir():
             for p in sorted(path.rglob("*")):
@@ -93,14 +100,23 @@ class Engine:
 
         results: list[IngestResult] = []
         for p in targets:
-            results.append(self._ingest_file(p, log, force))
+            results.append(self._ingest_file(p, log, force, grps))
         return results
 
-    def _ingest_file(self, path: Path, log: Logger, force: bool) -> IngestResult:
+    def _ingest_file(self, path: Path, log: Logger, force: bool,
+                     groups: list[str]) -> IngestResult:
         doc_id = doc_id_for(path)
         if not force and self.manifest.unchanged(path):
-            log(f"  skip (unchanged): {path.name}")
             rec = self.manifest.get(doc_id)
+            # union: add any new group memberships without losing existing ones
+            new = [g for g in groups if rec and g not in rec.groups]
+            if new:
+                for g in new:
+                    self.manifest.add_to_group(doc_id, g)
+                log(f"  added to group(s) {', '.join(new)}: {path.name}")
+                rec = self.manifest.get(doc_id)
+            else:
+                log(f"  skip (unchanged): {path.name}")
             return IngestResult(doc_id, rec.source_path if rec else path.stem,
                                 rec.chunk_count if rec else 0,
                                 rec.diagram_count if rec else 0, skipped=True)
@@ -120,7 +136,10 @@ class Engine:
         if parsed.images:
             log(f"  diagrams: {len(diagram_descs)}/{len(parsed.images)} images described")
 
-        chunks = chunker.build_chunks(self.cfg, doc_id, str(path.resolve()), parsed, diagram_descs)
+        primary = groups[0] if groups else "default"
+        chunks = chunker.build_chunks(
+            self.cfg, doc_id, str(path.resolve()), parsed, diagram_descs, group=primary
+        )
         if not chunks:
             log(f"  (no text extracted) {path.name}")
             return IngestResult(doc_id, parsed.title, 0, 0)
@@ -131,9 +150,10 @@ class Engine:
             c.vector = v
 
         self.store.add(chunks)
-        rec = new_record(path, chunk_count=len(chunks), diagram_count=len(diagram_descs))
+        rec = new_record(path, chunk_count=len(chunks),
+                         diagram_count=len(diagram_descs), groups=groups)
         self.manifest.upsert(rec)
-        log(f"  indexed: {path.name} ({len(chunks)} chunks)")
+        log(f"  indexed: {path.name} ({len(chunks)} chunks) [groups: {', '.join(groups)}]")
         return IngestResult(doc_id, parsed.title, len(chunks), len(diagram_descs))
 
     # --- remove -----------------------------------------------------------
@@ -147,10 +167,36 @@ class Engine:
             log(f"removed: {rec.source_path}")
         return rec
 
+    # --- groups -----------------------------------------------------------
+    def list_groups(self) -> list[str]:
+        return self.manifest.groups()
+
+    def add_doc_to_group(self, doc_id: str, group: str) -> bool:
+        """Add a document to a group (membership is many-to-many)."""
+        return self.manifest.add_to_group(doc_id, group)
+
+    def remove_doc_from_group(self, doc_id: str, group: str) -> bool:
+        """Detach a document from a group (falls back to 'default' if none left)."""
+        return self.manifest.remove_from_group(doc_id, group)
+
+    def remove_group(self, group: str, log: Logger) -> int:
+        """Detach every document from a group (docs are kept). Returns count."""
+        docs = self.manifest.all(group=group)
+        for rec in docs:
+            self.manifest.remove_from_group(rec.doc_id, group)
+        if docs:
+            log(f"removed group '{group}' ({len(docs)} docs detached)")
+        return len(docs)
+
     # --- retrieve ---------------------------------------------------------
-    def retrieve(self, query: str, k: int | None = None, kind: str | None = None) -> list[Hit]:
+    def retrieve(self, query: str, k: int | None = None, kind: str | None = None,
+                 group: str | None = _ACTIVE) -> list[Hit]:
+        """group: a name to scope to; None = all groups; _ACTIVE = cfg.active_group."""
+        scope = self.cfg.active_group if group is _ACTIVE else group
+        # None scope = all groups (no doc filter); a name = restrict to its members
+        doc_ids = None if scope is None else [r.doc_id for r in self.manifest.all(group=scope)]
         vec = self.embedder.embed_one(query)
-        return self.store.search(vec, k or self.cfg.top_k, kind=kind)
+        return self.store.search(vec, k or self.cfg.top_k, kind=kind, doc_ids=doc_ids)
 
     # --- local answer -----------------------------------------------------
     def answer_local(self, system: str, user: str) -> str:

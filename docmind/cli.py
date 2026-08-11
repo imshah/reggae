@@ -59,12 +59,14 @@ def _sources_panel(hits) -> None:
 def add(
     path: str = typer.Argument(..., help="File or directory to ingest"),
     force: bool = typer.Option(False, "--force", help="Re-ingest even if unchanged"),
+    group: Optional[List[str]] = typer.Option(None, "--group", "-g", help="Group(s) to ingest into; repeat for several (default: active group)"),
 ) -> None:
     """Ingest documents (pdf/docx/txt/md), describing diagrams locally."""
     eng = _engine()
-    console.print(f"[bold]Ingesting[/bold] {path}")
+    grps = group or [eng.cfg.active_group]
+    console.print(f"[bold]Ingesting[/bold] {path} [dim](groups: {', '.join(grps)})[/dim]")
     try:
-        results = eng.ingest_path(Path(path), _log, force=force)
+        results = eng.ingest_path(Path(path), _log, force=force, groups=group)
     except ValueError as e:
         console.print(f"[red]{e}[/red]")
         raise typer.Exit(1)
@@ -75,22 +77,71 @@ def add(
 
 
 @app.command(name="list")
-def list_docs() -> None:
-    """List indexed documents."""
+def list_docs(
+    group: Optional[str] = typer.Option(None, "--group", "-g", help="Only this group"),
+    all_groups: bool = typer.Option(False, "--all", help="Show every group"),
+) -> None:
+    """List indexed documents (defaults to the active group)."""
     eng = _engine()
-    docs = eng.manifest.all()
+    scope = None if all_groups else (group or eng.cfg.active_group)
+    docs = eng.manifest.all(group=scope)
+    title = "Indexed documents" + ("" if scope is None else f" — group: {scope}")
     if not docs:
-        console.print("[dim]No documents indexed yet. Use `docmind add <path>`.[/dim]")
+        hint = "Use `docmind add <path>`." if scope is None else \
+            f"No docs in group '{scope}'. Try `docmind list --all`."
+        console.print(f"[dim]No documents. {hint}[/dim]")
         return
-    table = Table(title="Indexed documents")
+    table = Table(title=title)
     table.add_column("doc_id", style="cyan")
+    table.add_column("group", style="magenta")
     table.add_column("source")
     table.add_column("chunks", justify="right")
     table.add_column("diagrams", justify="right")
     for d in docs:
-        table.add_row(d.doc_id, d.source_path, str(d.chunk_count), str(d.diagram_count))
+        table.add_row(d.doc_id, ", ".join(d.groups), d.source_path, str(d.chunk_count), str(d.diagram_count))
     console.print(table)
     console.print(f"[dim]Total chunks in store: {eng.store.count()}[/dim]")
+
+
+_GROUP_USAGE = ("Usage: group show | group use <name> | group add <doc_id> <name> | "
+                "group remove-doc <doc_id> <name> | group remove <name>")
+
+
+@app.command()
+def group(
+    action: str = typer.Argument("show", help="show | use <name> | add <doc_id> <name> | remove-doc <doc_id> <name> | remove <name>"),
+    arg1: Optional[str] = typer.Argument(None),
+    arg2: Optional[str] = typer.Argument(None),
+) -> None:
+    """Manage document groups (a document can belong to several)."""
+    eng = _engine()
+    if action == "show":
+        active = eng.cfg.active_group
+        console.print(f"active group: [cyan]{active}[/cyan]")
+        table = Table(title="Groups")
+        table.add_column("group", style="magenta")
+        table.add_column("docs", justify="right")
+        for g in eng.list_groups() or ["default"]:
+            n = len(eng.manifest.all(group=g))
+            table.add_row(("▶ " if g == active else "") + g, str(n))
+        console.print(table)
+    elif action == "use" and arg1:
+        eng.cfg.set("active_group", arg1)
+        console.print(f"[green]active group → {arg1}[/green]")
+    elif action == "add" and arg1 and arg2:
+        ok = eng.add_doc_to_group(arg1, arg2)
+        console.print(f"[green]added {arg1} → group '{arg2}'[/green]" if ok
+                      else f"[red]no such doc_id: {arg1}[/red]")
+    elif action == "remove-doc" and arg1 and arg2:
+        ok = eng.remove_doc_from_group(arg1, arg2)
+        console.print(f"[green]detached {arg1} from group '{arg2}'[/green]" if ok
+                      else f"[red]{arg1} is not in group '{arg2}'[/red]")
+    elif action == "remove" and arg1:
+        n = eng.remove_group(arg1, _log)
+        console.print(f"[green]removed group '{arg1}' ({n} docs detached)[/green]" if n
+                      else f"[yellow]no docs in group '{arg1}'[/yellow]")
+    else:
+        console.print(_GROUP_USAGE)
 
 
 @app.command()
@@ -109,10 +160,12 @@ def ask(
     provider: Optional[str] = typer.Option(None, "--provider", help="claude|kimi (for escalated calls)"),
     remote: bool = typer.Option(False, "--remote", help="Force remote provider"),
     local: bool = typer.Option(False, "--local", help="Force local model"),
+    group: Optional[str] = typer.Option(None, "--group", "-g", help="Scope to a group (default: active group)"),
+    all_groups: bool = typer.Option(False, "--all-groups", help="Search across all groups"),
 ) -> None:
     """Answer a question across the corpus, with citations."""
     eng = _engine()
-    _run_ask(eng, " ".join(question), provider, remote, local)
+    _run_ask(eng, " ".join(question), provider, remote, local, group, all_groups)
 
 
 @app.command()
@@ -120,10 +173,12 @@ def gaps(
     scope: Optional[str] = typer.Option(None, "--scope", help="Focus area"),
     provider: Optional[str] = typer.Option(None, "--provider", help="claude|kimi"),
     local: bool = typer.Option(False, "--local", help="Force the local model (no API key needed)"),
+    group: Optional[str] = typer.Option(None, "--group", "-g", help="Scope to a group (default: active group)"),
+    all_groups: bool = typer.Option(False, "--all-groups", help="Analyse across all groups"),
 ) -> None:
     """Gap analysis for a senior tech-management lens (remote, falls back to local)."""
     eng = _engine()
-    _run_gaps(eng, scope, provider, critique=False, local=local)
+    _run_gaps(eng, scope, provider, critique=False, local=local, group=group, all_groups=all_groups)
 
 
 @app.command()
@@ -131,10 +186,12 @@ def critique(
     scope: Optional[str] = typer.Option(None, "--scope", help="Focus area"),
     provider: Optional[str] = typer.Option(None, "--provider", help="claude|kimi"),
     local: bool = typer.Option(False, "--local", help="Force the local model (no API key needed)"),
+    group: Optional[str] = typer.Option(None, "--group", "-g", help="Scope to a group (default: active group)"),
+    all_groups: bool = typer.Option(False, "--all-groups", help="Review across all groups"),
 ) -> None:
     """Architecture critique / design review (remote, falls back to local)."""
     eng = _engine()
-    _run_gaps(eng, scope, provider, critique=True, local=local)
+    _run_gaps(eng, scope, provider, critique=True, local=local, group=group, all_groups=all_groups)
 
 
 @app.command()
@@ -144,10 +201,13 @@ def diagram(
     provider: Optional[str] = typer.Option(None, "--provider", help="claude|kimi"),
     local: bool = typer.Option(False, "--local", help="Force the local model (no API key needed)"),
     freeform: bool = typer.Option(False, "--freeform", help="Build from your description, ignore the corpus"),
+    group: Optional[str] = typer.Option(None, "--group", "-g", help="Scope to a group (default: active group)"),
+    all_groups: bool = typer.Option(False, "--all-groups", help="Draw from all groups"),
 ) -> None:
     """Generate a Mermaid diagram (grounded in the corpus; remote → local fallback)."""
     eng = _engine()
-    _run_diagram(eng, " ".join(description), render, provider, mindmap=False, local=local, freeform=freeform)
+    _run_diagram(eng, " ".join(description), render, provider, mindmap=False, local=local,
+                 freeform=freeform, group=group, all_groups=all_groups)
 
 
 @app.command()
@@ -157,10 +217,13 @@ def mindmap(
     provider: Optional[str] = typer.Option(None, "--provider", help="claude|kimi"),
     local: bool = typer.Option(False, "--local", help="Force the local model (no API key needed)"),
     freeform: bool = typer.Option(False, "--freeform", help="Build from your topic, ignore the corpus"),
+    group: Optional[str] = typer.Option(None, "--group", "-g", help="Scope to a group (default: active group)"),
+    all_groups: bool = typer.Option(False, "--all-groups", help="Draw from all groups"),
 ) -> None:
     """Generate a Mermaid mind map (grounded in the corpus; remote → local fallback)."""
     eng = _engine()
-    _run_diagram(eng, " ".join(topic), render, provider, mindmap=True, local=local, freeform=freeform)
+    _run_diagram(eng, " ".join(topic), render, provider, mindmap=True, local=local,
+                 freeform=freeform, group=group, all_groups=all_groups)
 
 
 @app.command()
@@ -225,10 +288,20 @@ def ui(
 # --- task runners (shared by CLI + REPL) -----------------------------------
 
 
-def _run_ask(eng: Engine, question: str, provider, remote: bool, local: bool) -> None:
+def _retrieve(eng: Engine, query: str, group, all_groups: bool, k=None, kind=None):
+    """Resolve group scope: --all-groups → all; --group X → X; else active group."""
+    if all_groups:
+        return eng.retrieve(query, k=k, kind=kind, group=None)
+    if group:
+        return eng.retrieve(query, k=k, kind=kind, group=group)
+    return eng.retrieve(query, k=k, kind=kind)  # default: active group
+
+
+def _run_ask(eng: Engine, question: str, provider, remote: bool, local: bool,
+             group=None, all_groups: bool = False) -> None:
     force = Route.REMOTE if remote else Route.LOCAL if local else None
     route = eng.route(question, force)
-    hits = eng.retrieve(question)
+    hits = _retrieve(eng, question, group, all_groups)
     system, user = qa_task.build_prompt(question, hits)
 
     if route == Route.LOCAL:
@@ -249,8 +322,10 @@ def _run_ask(eng: Engine, question: str, provider, remote: bool, local: bool) ->
     _sources_panel(hits)
 
 
-def _run_gaps(eng: Engine, scope, provider, critique: bool, local: bool = False) -> None:
-    hits = eng.retrieve(scope or "architecture process ownership risk", k=eng.cfg.top_k * 2)
+def _run_gaps(eng: Engine, scope, provider, critique: bool, local: bool = False,
+              group=None, all_groups: bool = False) -> None:
+    hits = _retrieve(eng, scope or "architecture process ownership risk",
+                     group, all_groups, k=eng.cfg.top_k * 2)
     if not hits:
         console.print("[yellow]No indexed content to analyse. Add documents first.[/yellow]")
         return
@@ -268,12 +343,13 @@ def _run_gaps(eng: Engine, scope, provider, critique: bool, local: bool = False)
 
 
 def _run_diagram(eng: Engine, description: str, render: bool, provider, mindmap: bool,
-                 local: bool = False, freeform: bool = False) -> None:
+                 local: bool = False, freeform: bool = False,
+                 group=None, all_groups: bool = False) -> None:
     if freeform:
         hits = []
         system, user = diagram_task.build_freeform_prompt(description, mindmap)
     else:
-        hits = eng.retrieve(description, k=eng.cfg.top_k * 2)
+        hits = _retrieve(eng, description, group, all_groups, k=eng.cfg.top_k * 2)
         system, user = diagram_task.build_diagram_prompt(description, hits, mindmap)
     res = eng.generate(
         system, user, heavy=False, log=_log, confirm=_confirm, force_local=local,
@@ -319,10 +395,13 @@ _HELP = """[bold]Commands[/bold]
   critique [scope]        design review (remote)
   diagram <desc>          Mermaid diagram (remote)
   mindmap <topic>         Mermaid mind map (remote)
+  group [name]            show groups / switch active group
   provider [claude|kimi]  show/switch remote provider
   config                  show configuration
   help                    this help
   quit / exit             leave
+
+Queries are scoped to the active group. Add `--all` to a command to span all groups.
 """
 
 
@@ -333,7 +412,8 @@ def _repl() -> None:
     eng = _engine()
     console.print(
         Panel.fit(
-            f"docmind — provider: [cyan]{eng.cfg.remote_provider}[/cyan] · "
+            f"docmind — group: [magenta]{eng.cfg.active_group}[/magenta] · "
+            f"provider: [cyan]{eng.cfg.remote_provider}[/cyan] · "
             f"local: [cyan]{eng.cfg.local_chat_model}[/cyan]\nType [bold]help[/bold] for commands.",
             title="interactive",
         )
@@ -360,18 +440,26 @@ def _repl() -> None:
                 _repl_list(eng)
             elif cmd == "remove" and rest:
                 eng.remove(rest, _log)
+            elif cmd == "group":
+                _repl_group(eng, rest)
             elif cmd == "ask" and rest:
-                _run_ask(eng, rest, None, False, False)
+                text, allg = _strip_all(rest)
+                _run_ask(eng, text, None, False, False, all_groups=allg)
             elif cmd == "ask!" and rest:
-                _run_ask(eng, rest, None, True, False)
+                text, allg = _strip_all(rest)
+                _run_ask(eng, text, None, True, False, all_groups=allg)
             elif cmd == "gaps":
-                _run_gaps(eng, rest or None, None, critique=False)
+                text, allg = _strip_all(rest)
+                _run_gaps(eng, text or None, None, critique=False, all_groups=allg)
             elif cmd == "critique":
-                _run_gaps(eng, rest or None, None, critique=True)
+                text, allg = _strip_all(rest)
+                _run_gaps(eng, text or None, None, critique=True, all_groups=allg)
             elif cmd == "diagram" and rest:
-                _run_diagram(eng, rest, False, None, mindmap=False)
+                text, allg = _strip_all(rest)
+                _run_diagram(eng, text, False, None, mindmap=False, all_groups=allg)
             elif cmd == "mindmap" and rest:
-                _run_diagram(eng, rest, False, None, mindmap=True)
+                text, allg = _strip_all(rest)
+                _run_diagram(eng, text, False, None, mindmap=True, all_groups=allg)
             elif cmd == "provider":
                 _repl_provider(eng, rest)
             elif cmd == "config":
@@ -384,13 +472,34 @@ def _repl() -> None:
     console.print("[dim]bye[/dim]")
 
 
+def _strip_all(rest: str) -> tuple[str, bool]:
+    """Pull a `--all` / `--all-groups` token out of REPL args."""
+    toks = rest.split()
+    allg = any(t in ("--all", "--all-groups") for t in toks)
+    return " ".join(t for t in toks if t not in ("--all", "--all-groups")), allg
+
+
 def _repl_list(eng: Engine) -> None:
-    docs = eng.manifest.all()
+    docs = eng.manifest.all(group=eng.cfg.active_group)
     if not docs:
-        console.print("[dim]No documents indexed.[/dim]")
+        console.print(f"[dim]No documents in group '{eng.cfg.active_group}'. "
+                      f"Use `group <name>` to switch.[/dim]")
         return
     for d in docs:
-        console.print(f"[cyan]{d.doc_id}[/cyan]  {d.source_path}  ({d.chunk_count} chunks, {d.diagram_count} diagrams)")
+        console.print(f"[cyan]{d.doc_id}[/cyan]  [magenta]{', '.join(d.groups)}[/magenta]  {d.source_path}  "
+                      f"({d.chunk_count} chunks, {d.diagram_count} diagrams)")
+
+
+def _repl_group(eng: Engine, rest: str) -> None:
+    if not rest:
+        active = eng.cfg.active_group
+        console.print(f"active group: [magenta]{active}[/magenta]")
+        for g in eng.list_groups() or ["default"]:
+            n = len(eng.manifest.all(group=g))
+            console.print(f"  {'▶ ' if g == active else '  '}{g}  ({n} docs)")
+        return
+    eng.cfg.set("active_group", rest)
+    console.print(f"[green]active group → {rest}[/green]")
 
 
 def _repl_provider(eng: Engine, rest: str) -> None:

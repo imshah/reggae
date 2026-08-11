@@ -115,15 +115,24 @@ docmind ask "what triggers onboarding?"
 ## Usage
 
 ```bash
-docmind add ./docs                 # ingest a file or directory
-docmind list                       # show indexed docs
-docmind ask "what triggers onboarding?"
+docmind add ./docs                 # ingest into the active group
+docmind add ./docs --group ops     # ingest into a specific group
+docmind add ./docs -g ops -g qa    # ingest into several groups at once
+docmind list                       # docs in the active group  (--all for every group)
+docmind ask "what triggers onboarding?"            # scoped to the active group
+docmind ask "..." --group ops                      # scope one query to a group
+docmind ask "..." --all-groups                     # search across all groups
 docmind gaps --scope "order flow"  # gap analysis (remote, falls back to local)
 docmind critique                   # design review (remote, falls back to local)
 docmind diagram "end-to-end order flow" --render   # Mermaid → SVG
 docmind mindmap "incident response"
 docmind mindmap --local --freeform "MO system: ingestion, engine, reporting"
 docmind remove <doc_id>            # clean removal (chunks + images)
+docmind group                        # show active group + all groups with counts
+docmind group use ops                # set the active group (scopes queries/ingest)
+docmind group add <doc_id> projX     # add a document to a group (keeps existing ones)
+docmind group remove-doc <doc_id> projX  # detach a document from a group
+docmind group remove projX           # detach every doc from a group (docs are kept)
 docmind config show                # view/change settings
 docmind repl                       # interactive terminal session
 docmind ui                         # web UI with saved chat history (see below)
@@ -143,6 +152,39 @@ offline. Control it explicitly:
 - `--remote` (on `ask`) / omit `--local` — use the remote provider.
 - `--freeform` (on `diagram`/`mindmap`) — build from your text alone, ignoring
   the corpus (handy when the topic isn't in your documents).
+- `--group <name>` / `--all-groups` (on `ask`/`gaps`/`critique`/`diagram`/
+  `mindmap`) — scope one call to a group, or search across all groups.
+
+## Groups
+
+Organise documents into **groups** (collections) so unrelated corpora never
+pollute each other's answers — e.g. `onboarding` vs `order-system` vs a client
+project. **A document can belong to several groups** (default: `default`), so the
+same doc can be surfaced under multiple collections without duplicating it.
+Queries are **scoped to the active group** unless you say otherwise.
+
+```bash
+docmind add ./client-x --group clientX   # ingest into a group (creates it if new)
+docmind add ./shared -g clientX -g ops   # ingest into several groups at once
+docmind group                            # show the active group + all groups (with counts)
+docmind group use clientX                # switch the active group — scopes future queries/ingest
+docmind ask "what's the SLA?"            # answered only from clientX docs
+docmind ask "..." --group ops            # override scope for one call
+docmind ask "..." --all-groups           # search every group at once
+docmind group add <doc_id> ops           # add a doc to another group (keeps existing ones)
+docmind group remove-doc <doc_id> ops    # detach a doc from a group
+docmind group remove clientX             # detach every doc from a group (docs are kept)
+```
+
+Membership is additive: re-`add`-ing an already-indexed file with a new `--group`
+**adds** that group rather than moving the doc. Removing a group only **detaches**
+it — no documents are deleted, and a doc left with no groups falls back to
+`default`.
+
+Existing indexes migrate automatically: documents indexed before groups existed
+land in `default` (no re-index). In the terminal REPL, `group` shows/lists and
+`group <name>` switches the active group; append `--all` to a command to span all
+groups.
 
 ## Web UI
 
@@ -156,8 +198,14 @@ browser:
 
 - **Chat** with streamed answers, a per-turn badge (route / model / cost) and a
   Sources panel; a Route toggle (Auto/Local/Remote) and provider selector.
-- **Documents** (sidebar): drag-drop upload → ingest, list with chunk/diagram
-  counts, remove, and **Re-index all**.
+- **Groups** (sidebar): a **Group** selector scopes what you view and query
+  ("All groups" searches everything). At the uploader, an **"Ingest into group"**
+  field tags new files — type a new name to create a group on the fly. Answers,
+  slash commands, and analysis all stay within the selected group.
+- **Documents** (sidebar): drag-drop upload → ingest, list (filtered by the
+  selected group) with chunk/diagram counts, a per-doc **Edit groups**
+  multiselect (add/remove memberships, or type a new group) and remove, and
+  **Re-index all** (preserving each doc's groups).
 - **Slash commands** (typed in the chat box, results land in the transcript):
   `/gaps [scope]`, `/critique [scope]`, `/diagram <desc>`, `/mindmap <topic>`,
   `/help`. Add `--freeform` to `/diagram` / `/mindmap` to build from your text,
@@ -223,6 +271,7 @@ docmind config set <key> <value>    # change one value (saved immediately)
 | `kimi_model` | `kimi-k3-turbo-preview` | Kimi model for escalated `ask`. |
 | `kimi_heavy_model` | `kimi-k3-turbo-preview` | Kimi model for `gaps` / `critique`. |
 | `top_k` | `8` | Chunks retrieved per query (applies immediately). |
+| `active_group` | `default` | Group scope for queries/ingest (env: `DOCMIND_ACTIVE_GROUP`). |
 | `chunk_tokens` | `800` | Target chunk size. **Ingest-time — needs `add --force`.** |
 | `chunk_overlap` | `120` | Overlap between chunks. **Ingest-time — needs `add --force`.** |
 | `budget_cap` | `5.0` | Per-session remote spend cap (USD). |

@@ -35,6 +35,7 @@ def build_chunks(
     source_path: str,
     parsed: ParsedDoc,
     diagram_descriptions: list[tuple[str, int, str]],
+    group: str = "default",
 ) -> list[Chunk]:
     """diagram_descriptions: list of (description, page, section)."""
     max_words = int(cfg.chunk_tokens / 1.3)
@@ -54,6 +55,7 @@ def build_chunks(
                     page=block.page,
                     text=piece,
                     vector=[],  # filled by the embedder before storage
+                    group=group,
                 )
             )
 
@@ -69,6 +71,7 @@ def build_chunks(
                 page=page,
                 text=f"[Diagram] {desc}",
                 vector=[],
+                group=group,
             )
         )
 

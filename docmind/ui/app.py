@@ -43,49 +43,99 @@ def _ensure_active_session(store) -> str:
 # --- sidebar ---------------------------------------------------------------
 
 
+ALL_GROUPS_LABEL = "All groups"
+
+
+def _sidebar_group(eng: Engine) -> None:
+    """Group scope selector — sets st.session_state['ui_group'] for the whole app."""
+    st.subheader("🗂️ Group")
+    options = [ALL_GROUPS_LABEL] + eng.list_groups()
+    current = st.session_state.get("ui_group", eng.cfg.active_group)
+    if current not in options:
+        current = eng.cfg.active_group if eng.cfg.active_group in options else ALL_GROUPS_LABEL
+    choice = st.selectbox(
+        "Scope queries & uploads to", options, index=options.index(current),
+        help="Answers and analysis only use documents in this group. "
+        "'All groups' searches everything.",
+    )
+    st.session_state["ui_group"] = choice
+    st.caption(
+        "Isolated to this group — no cross-group context." if choice != ALL_GROUPS_LABEL
+        else "Searching across every group."
+    )
+
+
 def _sidebar_documents(eng: Engine) -> None:
     st.subheader("📚 Documents")
+    scope = _selected_group()  # None = all groups, else a name
+    default_ingest_group = scope or "default"
+
     uploads = st.file_uploader(
         "Add documents",
         type=[e.lstrip(".") for e in sorted(parsers.SUPPORTED)],
         accept_multiple_files=True,
     )
+    ingest_group = st.text_input(
+        "Ingest into group", value=default_ingest_group,
+        help="Tag for the uploaded files. Type a new name to create a group.",
+    ).strip() or "default"
     if uploads and st.button("Ingest uploaded", use_container_width=True):
         ensure_dirs()
         UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-        with st.status("Ingesting…", expanded=True) as status:
+        with st.status(f"Ingesting into '{ingest_group}'…", expanded=True) as status:
             log = lambda m: status.write(m)
             for uf in uploads:
                 dest = UPLOAD_DIR / uf.name
                 dest.write_bytes(uf.getbuffer())
                 try:
-                    eng.ingest_path(dest, log)
+                    eng.ingest_path(dest, log, groups=[ingest_group])
                 except Exception as e:  # noqa: BLE001 - surface any parse error
                     log(f"error on {uf.name}: {e}")
             status.update(label="Ingest complete", state="complete")
         st.rerun()
 
-    docs = eng.manifest.all()
+    docs = eng.manifest.all(group=scope)
     if not docs:
-        st.caption("No documents indexed yet.")
+        st.caption("No documents in this scope yet.")
+    all_groups = eng.list_groups()
     for d in docs:
-        c1, c2 = st.columns([5, 1])
         name = Path(d.source_path).name
-        c1.caption(f"**{name}** · {d.chunk_count} chunks · {d.diagram_count} diagrams")
+        c1, c2 = st.columns([5, 1])
+        c1.caption(f"**{name}** · `{', '.join(d.groups)}` · {d.chunk_count} chunks · {d.diagram_count} diagrams")
         if c2.button("🗑", key=f"rm_{d.doc_id}", help="Remove"):
             eng.remove(d.doc_id, log=lambda m: None)
             st.rerun()
+        with c1.popover("Edit groups"):
+            options = sorted(set(all_groups) | set(d.groups))
+            selected = st.multiselect(
+                "Member of", options, default=d.groups, key=f"grp_{d.doc_id}",
+                help="A document can belong to several groups.",
+            )
+            new_group = st.text_input("Add a new group", key=f"newgrp_{d.doc_id}").strip()
+            if st.button("Save groups", key=f"grpbtn_{d.doc_id}"):
+                target = set(selected) | ({new_group} if new_group else set())
+                for g in target - set(d.groups):
+                    eng.add_doc_to_group(d.doc_id, g)
+                for g in set(d.groups) - target:
+                    eng.remove_doc_from_group(d.doc_id, g)
+                st.rerun()
 
-    if docs and st.button("Re-index all", use_container_width=True):
+    if docs and st.button("Re-index all (this scope)", use_container_width=True):
         with st.status("Re-indexing…", expanded=True) as status:
             for d in docs:
                 p = Path(d.source_path)
                 if p.exists():
-                    eng.ingest_path(p, log=lambda m: status.write(m), force=True)
+                    eng.ingest_path(p, log=lambda m: status.write(m), force=True, groups=d.groups)
                 else:
                     status.write(f"missing source, skipped: {p}")
             status.update(label="Re-index complete", state="complete")
         st.rerun()
+
+
+def _selected_group() -> str | None:
+    """Resolve the sidebar selection into a retrieval scope: None = all groups."""
+    label = st.session_state.get("ui_group", ALL_GROUPS_LABEL)
+    return None if label == ALL_GROUPS_LABEL else label
 
 
 def _sidebar_config(eng: Engine) -> None:
@@ -267,7 +317,7 @@ def _answer_ask(eng: Engine, store, sid: str, prompt: str, override: str, provid
     """Produce the assistant turn for a question (user turn handled by dispatcher)."""
     force = {"Local": Route.LOCAL, "Remote": Route.REMOTE}.get(override)
     route = eng.route(prompt, force)
-    hits = eng.retrieve(prompt)
+    hits = eng.retrieve(prompt, group=_selected_group())
     system, user = qa_task.build_prompt(prompt, hits)
     srcs = sources_list(hits)
 
@@ -300,7 +350,7 @@ def _answer_ask(eng: Engine, store, sid: str, prompt: str, override: str, provid
 def _answer_analysis(eng: Engine, store, sid: str, kind: str, scope: str, provider: str,
                      override: str) -> None:
     """Produce the assistant turn for gaps/critique (user turn handled by dispatcher)."""
-    hits = eng.retrieve(scope or "architecture process ownership risk", k=eng.cfg.top_k * 2)
+    hits = eng.retrieve(scope or "architecture process ownership risk", k=eng.cfg.top_k * 2, group=_selected_group())
     if not hits:
         with st.chat_message("assistant"):
             st.warning("No indexed content to analyse. Add documents first.")
@@ -328,7 +378,7 @@ def _answer_diagram(eng: Engine, store, sid: str, desc: str, provider: str,
     if freeform:
         system, user = diagram_task.build_freeform_prompt(desc, mindmap)
     else:
-        hits = eng.retrieve(desc, k=eng.cfg.top_k * 2)
+        hits = eng.retrieve(desc, k=eng.cfg.top_k * 2, group=_selected_group())
         system, user = diagram_task.build_diagram_prompt(desc, hits, mindmap)
     with st.chat_message("assistant"):
         text, route, prov, model, cost = _generate_ui(
@@ -414,6 +464,8 @@ def main() -> None:
     sid = _ensure_active_session(store)
 
     with st.sidebar:
+        _sidebar_group(eng)
+        st.divider()
         _sidebar_documents(eng)
         st.divider()
         _sidebar_history(store)

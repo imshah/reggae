@@ -57,6 +57,7 @@ class Config:
     top_k: int = 8
     chunk_tokens: int = 800
     chunk_overlap: int = 120
+    active_group: str = "default"         # default group scope for queries/ingest
 
     # Cost guard (USD)
     budget_cap: float = 5.0               # per-session soft cap
