@@ -55,7 +55,7 @@ Only for `gaps` / `critique` / `diagram` / escalated `ask`. Without them docmind
 runs fully local.
 
 - **Claude**: `ANTHROPIC_API_KEY` (or `ant auth login`)
-- **Kimi K3**: `KIMI_API_KEY`
+- **Kimi (Moonshot)**: `KIMI_API_KEY`
 
 ## Setup
 
@@ -84,6 +84,26 @@ export KIMI_API_KEY=...
 ```
 
 Without any key, docmind runs fully local.
+
+### Enable Kimi (Moonshot)
+
+1. Put your key in `.env`: `KIMI_API_KEY=<key from platform.kimi.ai>`.
+2. **Top up the account** — a new key returns errors until it has a minimum balance.
+3. Select the provider (persists to `config.json`):
+
+   ```bash
+   docmind config set remote_provider kimi   # default for all remote calls
+   docmind ask "..." --provider kimi         # or override per call
+   ```
+
+Defaults: `kimi-k2.6` for escalated `ask`, `kimi-k3` for `gaps`/`critique`, against
+`https://api.moonshot.ai/v1`. Override any of these with `config set` (e.g.
+`docmind config set kimi_model kimi-k2.7-code`). Model availability varies by account
+— confirm the ids yours exposes with
+`curl -s https://api.moonshot.ai/v1/models -H "Authorization: Bearer $KIMI_API_KEY"`.
+
+> **Precedence:** if `DOCMIND_REMOTE_PROVIDER` is set in your shell or `.env`, it
+> overrides whatever `config set` persists.
 
 ### Running the `docmind` command
 
@@ -268,8 +288,8 @@ docmind config set <key> <value>    # change one value (saved immediately)
 | `claude_heavy_model` | `claude-opus-4-8` | Claude model for `gaps` / `critique`. |
 | `claude_effort` | `high` | Effort for supported Claude models (`low`/`medium`/`high`/`xhigh`/`max`). |
 | `kimi_base_url` | `https://api.moonshot.ai/v1` | Moonshot OpenAI-compatible endpoint. |
-| `kimi_model` | `kimi-k3-turbo-preview` | Kimi model for escalated `ask`. |
-| `kimi_heavy_model` | `kimi-k3-turbo-preview` | Kimi model for `gaps` / `critique`. |
+| `kimi_model` | `kimi-k2.6` | Kimi model for escalated `ask`. |
+| `kimi_heavy_model` | `kimi-k3` | Kimi model for `gaps` / `critique`. |
 | `top_k` | `8` | Chunks retrieved per query (applies immediately). |
 | `active_group` | `default` | Group scope for queries/ingest (env: `DOCMIND_ACTIVE_GROUP`). |
 | `chunk_tokens` | `800` | Target chunk size. **Ingest-time — needs `add --force`.** |

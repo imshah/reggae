@@ -26,11 +26,12 @@ _CLAUDE: dict[str, Rate] = {
     "claude-haiku-4-5": Rate(1.0, 5.0, 0.1, 1.25, supports_cache=True),
 }
 
-# Kimi / Moonshot (OpenAI-compatible). Placeholder rates — adjust to the
-# provider's published pricing for the exact model id in use.
+# Kimi / Moonshot (OpenAI-compatible). Approximate rates — verify against the
+# provider's published pricing at platform.kimi.ai for the exact model id in use.
 _KIMI: dict[str, Rate] = {
-    "kimi-k3-turbo-preview": Rate(0.60, 2.50),
-    "kimi-k3": Rate(1.0, 3.0),
+    "kimi-k3": Rate(1.15, 5.00),        # approximate — verify at platform.kimi.ai
+    "kimi-k2.7-code": Rate(0.95, 4.00),
+    "kimi-k2.6": Rate(0.95, 4.00),
 }
 
 _DEFAULT = Rate(3.0, 15.0)

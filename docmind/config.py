@@ -50,8 +50,8 @@ class Config:
 
     # Kimi (Moonshot, OpenAI-compatible)
     kimi_base_url: str = "https://api.moonshot.ai/v1"
-    kimi_model: str = "kimi-k3-turbo-preview"
-    kimi_heavy_model: str = "kimi-k3-turbo-preview"
+    kimi_model: str = "kimi-k2.6"          # escalated `ask` (cheaper)
+    kimi_heavy_model: str = "kimi-k3"      # gaps/critique (flagship)
 
     # Retrieval
     top_k: int = 8
