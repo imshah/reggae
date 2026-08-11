@@ -214,7 +214,7 @@ class Engine:
     def list_local_models(self) -> list[str]:
         """Installed local (Ollama) chat models; [] if the daemon is unavailable.
 
-        Excludes the embedding and vision models (not usable for chat/reasoning).
+        Only models on the CHAT_MODEL_FAMILIES allowlist are returned.
         """
         return LocalLLM(self.cfg).chat_models()
 

@@ -6,19 +6,38 @@ import ollama
 from docmind.config import Config
 
 
+# Explicit allowlist of local (Ollama) reasoning/chat model families. A model is
+# offered in the UI only if its base name (the part before the ':' tag) matches an
+# entry here EXACTLY — so 'qwen3' covers qwen3:14b and qwen3:1.7b, but not
+# qwen3-embedding (embeddings) or qwen2.5vl (vision), which are simply not listed.
+# Add a family here to expose its installed models.
+CHAT_MODEL_FAMILIES = {
+    "qwen3",
+    "qwen2.5",
+    "llama3",
+    "llama3.1",
+    "llama3.2",
+    "llama3.3",
+    "mistral",
+    "mixtral",
+    "gemma2",
+    "gemma3",
+    "phi3",
+    "phi4",
+    "deepseek-r1",
+    "deepseek-v3",
+}
+
+
 def _base_name(tag: str) -> str:
-    """Model name without its Ollama tag, e.g. 'qwen3-embedding:latest' → 'qwen3-embedding'."""
+    """Model name without its Ollama tag, e.g. 'qwen3:14b' → 'qwen3'."""
     return tag.split(":", 1)[0]
 
 
-def chat_capable(names: list[str], cfg: Config) -> list[str]:
-    """Keep only chat/reasoning models: drop the configured embedding + vision
-    models and anything that looks like an embedding model."""
-    exclude = {_base_name(cfg.embed_model), _base_name(cfg.vision_model)}
-    return [
-        n for n in names
-        if _base_name(n) not in exclude and "embed" not in n.lower()
-    ]
+def chat_capable(names: list[str]) -> list[str]:
+    """Keep only models whose family is on the CHAT_MODEL_FAMILIES allowlist
+    (exact base-name match)."""
+    return [n for n in names if _base_name(n) in CHAT_MODEL_FAMILIES]
 
 
 class LocalLLM:
@@ -51,8 +70,8 @@ class LocalLLM:
                 yield piece
 
     def chat_models(self) -> list[str]:
-        """Installed models usable for chat — excludes the embedding + vision models."""
-        return chat_capable(self.list_models(), self.cfg)
+        """Installed models on the chat-model allowlist (CHAT_MODEL_FAMILIES)."""
+        return chat_capable(self.list_models())
 
     def list_models(self) -> list[str]:
         """Installed Ollama model tags; [] on any failure (daemon down/offline)."""
