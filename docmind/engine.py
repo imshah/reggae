@@ -15,7 +15,7 @@ from docmind.config import IMAGES_DIR, Config
 from docmind.ingest import chunker, diagrams, parsers
 from docmind.llm import pricing
 from docmind.llm.local import LocalLLM
-from docmind.llm.provider import Completion, Provider, get_provider
+from docmind.llm.provider import Completion, Provider, get_provider, provider_for_model
 from docmind.llm.router import Route, route_for_ask
 from docmind.store.embeddings import Embedder
 from docmind.store.manifest import Manifest, doc_id_for, new_record
@@ -199,24 +199,34 @@ class Engine:
         return self.store.search(vec, k or self.cfg.top_k, kind=kind, doc_ids=doc_ids)
 
     # --- local answer -----------------------------------------------------
-    def answer_local(self, system: str, user: str) -> str:
-        return LocalLLM(self.cfg).chat(system, user)
+    def answer_local(self, system: str, user: str, model: str | None = None) -> str:
+        return LocalLLM(self.cfg).chat(system, user, model=model)
 
-    def answer_local_stream(self, system: str, user: str):
+    def answer_local_stream(self, system: str, user: str, model: str | None = None):
         """Yield answer chunks as they arrive (for responsive UIs)."""
-        yield from LocalLLM(self.cfg).chat_stream(system, user)
+        yield from LocalLLM(self.cfg).chat_stream(system, user, model=model)
+
+    # --- model discovery -------------------------------------------------
+    def available_models(self, provider_name: str | None = None) -> list[str]:
+        """Model ids the (active or named) remote provider exposes; [] if unavailable."""
+        return get_provider(self.cfg, provider_name).list_models()
+
+    def list_local_models(self) -> list[str]:
+        """Installed local (Ollama) chat models; [] if the daemon is unavailable.
+
+        Excludes the embedding and vision models (not usable for chat/reasoning).
+        """
+        return LocalLLM(self.cfg).chat_models()
 
     # --- remote estimate (no call) ---------------------------------------
     def estimate_remote(
-        self, system: str, user: str, *, heavy: bool, provider_name: str | None = None,
-        output_guess: int = 1500,
+        self, system: str, user: str, *, model: str, output_guess: int = 1500,
     ) -> "RemoteEstimate":
-        """Cost/availability preview so a UI can show the price before committing."""
-        provider: Provider = get_provider(self.cfg, provider_name)
+        """Cost/availability preview for an explicit remote model (vendor inferred)."""
+        provider: Provider = get_provider(self.cfg, provider_for_model(model))
         available, reason = provider.available()
-        model = provider.model_for(heavy)
-        in_tokens = provider.count_tokens(system, user, heavy=heavy) if available else 0
-        est = provider.estimate(in_tokens, output_guess, heavy=heavy) if available else 0.0
+        in_tokens = provider.count_tokens(system, user, model=model) if available else 0
+        est = provider.estimate(in_tokens, output_guess, model=model) if available else 0.0
         return RemoteEstimate(
             provider=provider.name,
             model=model,
@@ -239,15 +249,16 @@ class Engine:
         provider_name: str | None = None,
         output_guess: int = 1500,
         max_tokens: int = 4096,
+        model: str | None = None,
     ) -> Completion:
         provider: Provider = get_provider(self.cfg, provider_name)
         ok, msg = provider.available()
         if not ok:
             raise Aborted(msg)
 
-        in_tokens = provider.count_tokens(system, user, heavy=heavy)
-        est = provider.estimate(in_tokens, output_guess, heavy=heavy)
-        model = provider.model_for(heavy)
+        model = model or provider.model_for(heavy)
+        in_tokens = provider.count_tokens(system, user, heavy=heavy, model=model)
+        est = provider.estimate(in_tokens, output_guess, heavy=heavy, model=model)
         log(f"→ {provider.name}/{model}: ~{in_tokens} in tokens, est ${est:.4f}")
 
         if self.session_spent + est > self.cfg.budget_cap:
@@ -260,7 +271,7 @@ class Engine:
             if not confirm(f"This call is estimated at ${est:.4f}. Proceed?"):
                 raise Aborted("declined at cost prompt")
 
-        comp = provider.complete(system, user, heavy=heavy, max_tokens=max_tokens)
+        comp = provider.complete(system, user, heavy=heavy, max_tokens=max_tokens, model=model)
         actual = pricing.estimate_cost(
             comp.provider,
             comp.model,
@@ -295,6 +306,7 @@ class Engine:
         provider_name: str | None = None,
         output_guess: int = 1500,
         max_tokens: int = 4096,
+        model: str | None = None,
     ) -> GenResult:
         """Non-streaming generation used by diagram/gaps/critique.
 
@@ -307,7 +319,7 @@ class Engine:
                 comp = self.run_remote(
                     system, user, heavy=heavy, log=log, confirm=confirm,
                     provider_name=provider_name, output_guess=output_guess,
-                    max_tokens=max_tokens,
+                    max_tokens=max_tokens, model=model,
                 )
                 cost = pricing.estimate_cost(
                     comp.provider, comp.model,

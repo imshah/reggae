@@ -45,12 +45,24 @@ class ClaudeProvider:
     def model_for(self, heavy: bool) -> str:
         return self.cfg.claude_heavy_model if heavy else self.cfg.claude_model
 
+    def list_models(self) -> list[str]:
+        """Model ids the account exposes; [] on any failure (no key/offline).
+
+        The list endpoint auto-paginates when iterated directly.
+        """
+        try:
+            return sorted(m.id for m in self._get_client().models.list())
+        except Exception:
+            return []
+
     def _supports_effort(self, model: str) -> bool:
         return any(model.startswith(m) for m in _EFFORT_OK)
 
     # --- token counting ---------------------------------------------------
-    def count_tokens(self, system: str, user: str, *, heavy: bool = False) -> int:
-        model = self.model_for(heavy)
+    def count_tokens(
+        self, system: str, user: str, *, heavy: bool = False, model: str | None = None
+    ) -> int:
+        model = model or self.model_for(heavy)
         try:
             client = self._get_client()
             resp = client.messages.count_tokens(
@@ -63,9 +75,10 @@ class ClaudeProvider:
             # fall back to a rough word-based estimate if the API is unavailable
             return int((len(system.split()) + len(user.split())) * 1.3)
 
-    def estimate(self, input_tokens: int, output_tokens_guess: int, *, heavy: bool = False) -> float:
+    def estimate(self, input_tokens: int, output_tokens_guess: int, *, heavy: bool = False,
+                 model: str | None = None) -> float:
         return pricing.estimate_cost(
-            self.name, self.model_for(heavy), input_tokens, output_tokens_guess
+            self.name, model or self.model_for(heavy), input_tokens, output_tokens_guess
         )
 
     # --- completion -------------------------------------------------------
@@ -77,9 +90,10 @@ class ClaudeProvider:
         heavy: bool = False,
         cache_system: bool = True,
         max_tokens: int = 4096,
+        model: str | None = None,
     ) -> Completion:
         client = self._get_client()
-        model = self.model_for(heavy)
+        model = model or self.model_for(heavy)
 
         system_param = (
             [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}]

@@ -12,8 +12,8 @@ from docmind.config import DATA_DIR, Config, ensure_dirs
 from docmind.engine import Aborted, BudgetExceeded, Engine
 from docmind.history import Message
 from docmind.ingest import parsers
-from docmind.llm.provider import AVAILABLE_PROVIDERS
-from docmind.llm.router import Route
+from docmind.llm.local import LocalLLM
+from docmind.llm.provider import provider_for_model
 from docmind.tasks import diagram as diagram_task
 from docmind.tasks import gaps as gaps_task
 from docmind.tasks import qa as qa_task
@@ -138,6 +138,48 @@ def _selected_group() -> str | None:
     return None if label == ALL_GROUPS_LABEL else label
 
 
+@st.cache_data(ttl=600, show_spinner=False)
+def _remote_models(provider_name: str) -> list[str]:
+    """Model ids the provider exposes (cached 10 min). [] → text-box fallback."""
+    from docmind.llm.provider import get_provider
+
+    try:
+        return get_provider(Config.load(), provider_name).list_models()
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _local_models() -> list[str]:
+    """Installed local (Ollama) chat models (cached 10 min). [] if unavailable.
+
+    Excludes embedding/vision models (not usable for chat)."""
+    try:
+        return LocalLLM(Config.load()).chat_models()
+    except Exception:
+        return []
+
+
+def _all_models() -> list[str]:
+    """Combined pick list for the model dropdowns: local, then Claude, then Kimi."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for m in _local_models() + _remote_models("claude") + _remote_models("kimi"):
+        if m not in seen:
+            seen.add(m)
+            out.append(m)
+    return out
+
+
+def _model_picker(label: str, current: str, options: list[str]):
+    """A dropdown of `options` (with `current` always selectable); falls back to a
+    free-text box when no models could be listed."""
+    if not options:
+        return st.text_input(label, current)   # listing failed → type an id
+    opts = ([current] if current and current not in options else []) + options
+    return st.selectbox(label, opts, index=opts.index(current) if current in opts else 0)
+
+
 def _sidebar_config(eng: Engine) -> None:
     st.subheader("⚙️ Configuration")
     cfg = Config.load()
@@ -146,25 +188,36 @@ def _sidebar_config(eng: Engine) -> None:
         if str(getattr(cfg, key)) != str(value):
             cfg.set(key, str(value))
 
-    prov = st.selectbox(
-        "Remote provider", list(AVAILABLE_PROVIDERS),
-        index=list(AVAILABLE_PROVIDERS).index(cfg.remote_provider)
-        if cfg.remote_provider in AVAILABLE_PROVIDERS else 0,
-    )
-    maybe_set("remote_provider", prov)
-
-    maybe_set("local_chat_model", st.text_input("Local chat model", cfg.local_chat_model))
     maybe_set("top_k", st.number_input("top_k (chunks retrieved)", 1, 50, cfg.top_k))
 
-    with st.expander("Remote models"):
-        maybe_set("claude_model", st.text_input("Claude model (ask)", cfg.claude_model))
-        maybe_set("claude_heavy_model", st.text_input("Claude model (gaps/critique)", cfg.claude_heavy_model))
+    with st.expander("Models", expanded=True):
+        st.caption("Pick a model per task — local (Ollama), Claude, or Kimi. "
+                   "The provider is inferred from the model.")
+        options = _all_models()   # local + claude + kimi
+        for field, label in (
+            ("ask_model", "Ask model"),
+            ("gaps_model", "Gaps model"),
+            ("critique_model", "Critique model"),
+            ("diagram_model", "Diagram / mindmap model"),
+        ):
+            current = getattr(cfg, field) or cfg.local_chat_model
+            maybe_set(field, _model_picker(label, current, options))
+        maybe_set("local_chat_model",
+                  _model_picker("Default Fallback Model", cfg.local_chat_model, _local_models()))
+        st.caption("Local (Ollama) model used for any task left unset above, and when a "
+                   "chosen remote model is unavailable or over the cost cap.")
         maybe_set("claude_effort", st.selectbox(
             "Claude effort", ["low", "medium", "high", "xhigh", "max"],
             index=["low", "medium", "high", "xhigh", "max"].index(cfg.claude_effort)
             if cfg.claude_effort in ["low", "medium", "high", "xhigh", "max"] else 2,
+            help="Applies only when a Claude model is selected.",
         ))
-        maybe_set("kimi_model", st.text_input("Kimi model", cfg.kimi_model))
+        if not options:
+            st.caption("Couldn't list any models (no keys / Ollama offline) — type an id manually.")
+        if st.button("↻ Refresh models", use_container_width=True):
+            _remote_models.clear()
+            _local_models.clear()
+            st.rerun()
 
     with st.expander("Chunking (needs re-index)"):
         st.caption("Changing these requires **Re-index all** to affect existing docs.")
@@ -246,109 +299,70 @@ def _render_transcript(store, sid: str) -> None:
 # --- actions ---------------------------------------------------------------
 
 
-def _run_remote_or_notice(eng: Engine, system: str, user: str, *, heavy: bool,
-                          provider: str | None, output_guess: int, max_tokens: int):
-    """Returns (text, provider, model, cost) or (None, ...) if not runnable."""
-    est = eng.estimate_remote(system, user, heavy=heavy, provider_name=provider,
-                              output_guess=output_guess)
-    if not est.available:
-        st.info(f"{est.reason}")
-        return None, est.provider, est.model, None
-    if est.over_cap:
-        st.error(
-            f"Estimated ${est.est_usd:.4f} would exceed the session budget cap. "
-            "Raise it in the sidebar (Cost guard) to proceed."
-        )
-        return None, est.provider, est.model, None
+def _run_model(eng: Engine, system: str, user: str, *, model: str,
+               output_guess: int, max_tokens: int):
+    """Run a task on an explicit model (provider inferred). Non-streaming.
+
+    Local models run directly; remote models go through the cost guard and fall
+    back to the local chat model when unavailable / over-cap / declined.
+    Returns (text, route, provider, model, cost).
+    """
+    if provider_for_model(model) == "local":
+        with st.spinner(f"Generating locally ({model})…"):
+            text = eng.answer_local(system, user, model=model)
+        return text, "local", None, model, 0.0
+
+    est = eng.estimate_remote(system, user, model=model, output_guess=output_guess)
+    if not est.available or est.over_cap:
+        reason = est.reason or "would exceed the session budget cap"
+        st.info(f"{reason} — using the local model ({eng.cfg.local_chat_model}).")
+        with st.spinner(f"Generating locally ({eng.cfg.local_chat_model})…"):
+            text = eng.answer_local(system, user)
+        return text, "local", None, eng.cfg.local_chat_model, 0.0
+
     st.caption(C.cost_caption(est, eng.session_spent, eng.cfg.budget_cap))
     try:
         with st.spinner(f"Calling {est.provider}/{est.model}…"):
-            comp = eng.run_remote(
-                system, user, heavy=heavy, log=lambda m: None,
-                confirm=lambda _m: True, provider_name=provider,
-                output_guess=output_guess, max_tokens=max_tokens,
-            )
-    except (Aborted, BudgetExceeded) as e:
-        st.error(str(e))
-        return None, est.provider, est.model, None
-    persist_spend(eng)
-    from docmind.llm import pricing
-    cost = pricing.estimate_cost(
-        comp.provider, comp.model, comp.usage.input_tokens, comp.usage.output_tokens,
-        comp.usage.cache_read_tokens, comp.usage.cache_write_tokens,
-    )
-    return comp.text, comp.provider, comp.model, cost
+            res = eng.generate(system, user, heavy=False, log=lambda m: None,
+                               confirm=lambda _m: True, model=model,
+                               provider_name=provider_for_model(model),
+                               output_guess=output_guess, max_tokens=max_tokens)
+        persist_spend(eng)
+        return res.text, res.route, res.provider, res.model, res.cost
+    except Exception as e:  # noqa: BLE001
+        st.warning(f"Remote call failed ({e}); using local model.")
+        with st.spinner(f"Generating locally ({eng.cfg.local_chat_model})…"):
+            text = eng.answer_local(system, user)
+        return text, "local", None, eng.cfg.local_chat_model, 0.0
 
 
-def _generate_ui(eng: Engine, system: str, user: str, *, heavy: bool, provider: str,
-                 output_guess: int, max_tokens: int, override: str):
-    """Generate for analysis/diagram: remote if possible/allowed, else local.
-
-    Honours the Route toggle (Local forces local) and the cost guard (over-cap or
-    unavailable → local fallback with a notice). Always returns text.
-    Returns (text, route, provider, model, cost).
-    """
-    force_local = override == "Local"
-    if not force_local:
-        est = eng.estimate_remote(system, user, heavy=heavy, provider_name=provider,
-                                  output_guess=output_guess)
-        if est.available and not est.over_cap:
-            st.caption(C.cost_caption(est, eng.session_spent, eng.cfg.budget_cap))
-            try:
-                with st.spinner(f"Calling {est.provider}/{est.model}…"):
-                    res = eng.generate(system, user, heavy=heavy, log=lambda m: None,
-                                       confirm=lambda _m: True, provider_name=provider,
-                                       output_guess=output_guess, max_tokens=max_tokens)
-                persist_spend(eng)
-                return res.text, res.route, res.provider, res.model, res.cost
-            except Exception as e:  # noqa: BLE001
-                st.warning(f"Remote call failed ({e}); using local model.")
-        else:
-            reason = est.reason or "would exceed the session budget cap"
-            st.info(f"{reason} — using the local model.")
-
-    with st.spinner(f"Generating locally ({eng.cfg.local_chat_model})…"):
-        res = eng.generate(system, user, heavy=heavy, log=lambda m: None,
-                           confirm=lambda _m: True, force_local=True)
-    return res.text, res.route, res.provider, res.model, res.cost
-
-
-def _answer_ask(eng: Engine, store, sid: str, prompt: str, override: str, provider: str) -> None:
+def _answer_ask(eng: Engine, store, sid: str, prompt: str, model: str) -> None:
     """Produce the assistant turn for a question (user turn handled by dispatcher)."""
-    force = {"Local": Route.LOCAL, "Remote": Route.REMOTE}.get(override)
-    route = eng.route(prompt, force)
     hits = eng.retrieve(prompt, group=_selected_group())
     system, user = qa_task.build_prompt(prompt, hits)
     srcs = sources_list(hits)
 
     with st.chat_message("assistant"):
-        if route == Route.LOCAL:
-            text = st.write_stream(eng.answer_local_stream(system, user))
-            st.caption(f"local · {eng.cfg.local_chat_model}")
+        if provider_for_model(model) == "local":
+            text = st.write_stream(eng.answer_local_stream(system, user, model=model))
+            st.caption(f"local · {model}")
             store.append(sid, Message(role="assistant", content=text, route="local",
-                                      model=eng.cfg.local_chat_model, cost=0.0, sources=srcs))
+                                      model=model, cost=0.0, sources=srcs))
         else:
-            text, prov, model, cost = _run_remote_or_notice(
-                eng, system, user, heavy=False, provider=provider,
-                output_guess=800, max_tokens=4096,
+            text, route, prov, used_model, cost = _run_model(
+                eng, system, user, model=model, output_guess=800, max_tokens=4096,
             )
-            if text is None:  # fall back to local
-                st.caption("falling back to local")
-                text = st.write_stream(eng.answer_local_stream(system, user))
-                store.append(sid, Message(role="assistant", content=text, route="local",
-                                          model=eng.cfg.local_chat_model, cost=0.0, sources=srcs))
-            else:
-                st.markdown(text)
-                store.append(sid, Message(role="assistant", content=text, route="remote",
-                                          provider=prov, model=model, cost=cost, sources=srcs))
+            st.markdown(text or "_(no answer)_")
+            st.caption(f"{route} · {used_model}" + (f" · ${cost:.4f}" if cost else ""))
+            store.append(sid, Message(role="assistant", content=text, route=route,
+                                      provider=prov, model=used_model, cost=cost, sources=srcs))
         if srcs:
             with st.expander(f"Sources ({len(srcs)})"):
                 for s in srcs:
                     st.markdown(f"- `{s}`")
 
 
-def _answer_analysis(eng: Engine, store, sid: str, kind: str, scope: str, provider: str,
-                     override: str) -> None:
+def _answer_analysis(eng: Engine, store, sid: str, kind: str, scope: str, model: str) -> None:
     """Produce the assistant turn for gaps/critique (user turn handled by dispatcher)."""
     hits = eng.retrieve(scope or "architecture process ownership risk", k=eng.cfg.top_k * 2, group=_selected_group())
     if not hits:
@@ -361,18 +375,17 @@ def _answer_analysis(eng: Engine, store, sid: str, kind: str, scope: str, provid
         system, user = gaps_task.build_gaps_prompt(hits, scope or None)
     srcs = sources_list(hits)
     with st.chat_message("assistant"):
-        text, route, prov, model, cost = _generate_ui(
-            eng, system, user, heavy=True, provider=provider,
-            output_guess=2500, max_tokens=6000, override=override,
+        text, route, prov, used_model, cost = _run_model(
+            eng, system, user, model=model, output_guess=2500, max_tokens=6000,
         )
         st.markdown(text or "_(no output)_")
-        st.caption(f"{route} · {model} · ${cost:.4f}")
+        st.caption(f"{route} · {used_model} · ${cost:.4f}")
         store.append(sid, Message(role="assistant", content=text, route=f"{kind}/{route}",
-                                  provider=prov, model=model, cost=cost, sources=srcs))
+                                  provider=prov, model=used_model, cost=cost, sources=srcs))
 
 
-def _answer_diagram(eng: Engine, store, sid: str, desc: str, provider: str,
-                    mindmap: bool, override: str, freeform: bool) -> None:
+def _answer_diagram(eng: Engine, store, sid: str, desc: str, model: str,
+                    mindmap: bool, freeform: bool) -> None:
     """Produce the assistant turn for a diagram/mind map (user turn handled by dispatcher)."""
     kind = "mindmap" if mindmap else "diagram"
     if freeform:
@@ -381,16 +394,15 @@ def _answer_diagram(eng: Engine, store, sid: str, desc: str, provider: str,
         hits = eng.retrieve(desc, k=eng.cfg.top_k * 2, group=_selected_group())
         system, user = diagram_task.build_diagram_prompt(desc, hits, mindmap)
     with st.chat_message("assistant"):
-        text, route, prov, model, cost = _generate_ui(
-            eng, system, user, heavy=False, provider=provider,
-            output_guess=800, max_tokens=4096, override=override,
+        text, route, prov, used_model, cost = _run_model(
+            eng, system, user, model=model, output_guess=800, max_tokens=4096,
         )
         code = diagram_task.extract_mermaid(text)
         out = diagram_task.write_outputs(desc, code, render=True)
         C.render_mermaid(code, out)
-        st.caption(f"{route} · {model} · ${cost:.4f}")
+        st.caption(f"{route} · {used_model} · ${cost:.4f}")
         store.append(sid, Message(role="assistant", content=f"```mermaid\n{code}\n```",
-                                  route=f"{kind}/{route}", provider=prov, model=model,
+                                  route=f"{kind}/{route}", provider=prov, model=used_model,
                                   cost=cost, artifact=out.get("svg")))
 
 
@@ -405,8 +417,8 @@ _COMMAND_HELP = (
     "- add `--freeform` to `/diagram` or `/mindmap` to build from your text, "
     "ignoring the corpus\n"
     "- `/help` — show this list\n\n"
-    "Anything without a leading `/` is answered as a question. The **Route** and "
-    "**Provider** controls above decide local vs. remote."
+    "Anything without a leading `/` is answered as a question. Each task's model is "
+    "chosen in the sidebar under **Configuration → Models**."
 )
 
 
@@ -417,16 +429,18 @@ def _strip_flag(text: str, *flags: str) -> tuple[str, bool]:
     return " ".join(kept), len(kept) != len(tokens)
 
 
-def _dispatch(eng: Engine, store, sid: str, prompt: str, override: str,
-              provider: str) -> None:
-    """Render + persist the user's turn, then route to the right producer."""
+def _dispatch(eng: Engine, store, sid: str, prompt: str, models: dict[str, str]) -> None:
+    """Render + persist the user's turn, then route to the right producer.
+
+    `models` maps each task ("ask"/"gaps"/"critique"/"diagram") to its chosen model id.
+    """
     with st.chat_message("user"):
         st.markdown(prompt)
     store.append(sid, Message(role="user", content=prompt))
 
     text = prompt.strip()
     if not text.startswith("/"):
-        _answer_ask(eng, store, sid, text, override, provider)
+        _answer_ask(eng, store, sid, text, models["ask"])
         return
 
     cmd, _, rest = text.partition(" ")
@@ -437,9 +451,9 @@ def _dispatch(eng: Engine, store, sid: str, prompt: str, override: str,
         with st.chat_message("assistant"):
             st.info(_COMMAND_HELP)
     elif cmd == "ask":
-        _answer_ask(eng, store, sid, rest, override, provider)
+        _answer_ask(eng, store, sid, rest, models["ask"])
     elif cmd in ("gaps", "critique"):
-        _answer_analysis(eng, store, sid, cmd, rest, provider, override)
+        _answer_analysis(eng, store, sid, cmd, rest, models[cmd])
     elif cmd in ("diagram", "mindmap"):
         desc, freeform = _strip_flag(rest, "--freeform", "-f")
         desc = desc.strip()
@@ -447,8 +461,8 @@ def _dispatch(eng: Engine, store, sid: str, prompt: str, override: str,
             with st.chat_message("assistant"):
                 st.warning(f"Give a description, e.g. `/{cmd} order fulfilment flow`.")
             return
-        _answer_diagram(eng, store, sid, desc, provider,
-                        mindmap=(cmd == "mindmap"), override=override, freeform=freeform)
+        _answer_diagram(eng, store, sid, desc, models["diagram"],
+                        mindmap=(cmd == "mindmap"), freeform=freeform)
     else:
         with st.chat_message("assistant"):
             st.warning(f"Unknown command `/{cmd}` — try `/help`.")
@@ -474,23 +488,24 @@ def main() -> None:
 
     st.title("📄 docmind")
 
-    # controls
-    c1, c2 = st.columns(2)
-    override = c1.radio("Route", ["Auto", "Local", "Remote"], horizontal=True)
-    provider = c2.selectbox("Provider", list(AVAILABLE_PROVIDERS),
-                            index=list(AVAILABLE_PROVIDERS).index(eng.cfg.remote_provider)
-                            if eng.cfg.remote_provider in AVAILABLE_PROVIDERS else 0)
+    # per-task models, resolved fresh after the sidebar may have changed them
+    cfg = Config.load()
+    models = {
+        task: getattr(cfg, f"{task}_model") or cfg.local_chat_model
+        for task in ("ask", "gaps", "critique", "diagram")
+    }
 
     st.caption(
         "Ask a question, or use a command: `/gaps` · `/critique` · `/diagram` · "
-        "`/mindmap` · `/help`  (add `--freeform` to build diagrams from your text)."
+        "`/mindmap` · `/help`  (add `--freeform` to build diagrams from your text). "
+        "Models are set in the sidebar."
     )
 
     _render_transcript(store, sid)
 
     prompt = st.chat_input("Ask a question, or type /help …")
     if prompt:
-        _dispatch(eng, store, sid, prompt, override, provider)
+        _dispatch(eng, store, sid, prompt, models)
 
 
 main()

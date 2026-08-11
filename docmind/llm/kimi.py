@@ -43,14 +43,25 @@ class KimiProvider:
     def model_for(self, heavy: bool) -> str:
         return self.cfg.kimi_heavy_model if heavy else self.cfg.kimi_model
 
-    def count_tokens(self, system: str, user: str, *, heavy: bool = False) -> int:
+    def list_models(self) -> list[str]:
+        """Model ids the account exposes; [] on any failure (no key/offline)."""
+        try:
+            resp = self._get_client().models.list()
+            return sorted(m.id for m in resp.data)
+        except Exception:
+            return []
+
+    def count_tokens(
+        self, system: str, user: str, *, heavy: bool = False, model: str | None = None
+    ) -> int:
         # Moonshot has a token-count endpoint but it varies by version;
         # a word-based estimate is sufficient for the pre-call cost guard.
         return int((len(system.split()) + len(user.split())) * 1.3)
 
-    def estimate(self, input_tokens: int, output_tokens_guess: int, *, heavy: bool = False) -> float:
+    def estimate(self, input_tokens: int, output_tokens_guess: int, *, heavy: bool = False,
+                 model: str | None = None) -> float:
         return pricing.estimate_cost(
-            self.name, self.model_for(heavy), input_tokens, output_tokens_guess
+            self.name, model or self.model_for(heavy), input_tokens, output_tokens_guess
         )
 
     def complete(
@@ -61,9 +72,10 @@ class KimiProvider:
         heavy: bool = False,
         cache_system: bool = True,
         max_tokens: int = 4096,
+        model: str | None = None,
     ) -> Completion:
         client = self._get_client()
-        model = self.model_for(heavy)
+        model = model or self.model_for(heavy)
         resp = client.chat.completions.create(
             model=model,
             max_tokens=max_tokens,

@@ -34,10 +34,13 @@ class Provider(Protocol):
 
     def model_for(self, heavy: bool) -> str: ...
 
-    def count_tokens(self, system: str, user: str, *, heavy: bool = False) -> int: ...
+    def count_tokens(
+        self, system: str, user: str, *, heavy: bool = False, model: str | None = None
+    ) -> int: ...
 
     def estimate(
-        self, input_tokens: int, output_tokens_guess: int, *, heavy: bool = False
+        self, input_tokens: int, output_tokens_guess: int, *, heavy: bool = False,
+        model: str | None = None,
     ) -> float: ...
 
     def complete(
@@ -48,9 +51,26 @@ class Provider(Protocol):
         heavy: bool = False,
         cache_system: bool = True,
         max_tokens: int = 4096,
+        model: str | None = None,
     ) -> Completion: ...
 
     def available(self) -> tuple[bool, str]: ...
+
+    def list_models(self) -> list[str]: ...
+
+
+def provider_for_model(model: str) -> str:
+    """Infer the vendor from a model id: 'claude' | 'kimi' | 'local'.
+
+    Remote ids use vendor prefixes (claude-*, kimi-*); anything else (e.g. an
+    Ollama tag like 'qwen3:14b') is treated as a local model.
+    """
+    m = (model or "").lower()
+    if m.startswith("claude"):
+        return "claude"
+    if m.startswith("kimi"):
+        return "kimi"
+    return "local"
 
 
 def get_provider(cfg: Config, name: str | None = None) -> Provider:

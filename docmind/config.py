@@ -53,6 +53,14 @@ class Config:
     kimi_model: str = "kimi-k2.6"          # escalated `ask` (cheaper)
     kimi_heavy_model: str = "kimi-k3"      # gaps/critique (flagship)
 
+    # Per-task model selection (UI). Empty = use local_chat_model.
+    # A concrete model id (claude-*, kimi-*, or a local Ollama tag); the provider
+    # is inferred from the id. See docmind.llm.provider.provider_for_model.
+    ask_model: str = ""
+    gaps_model: str = ""
+    critique_model: str = ""
+    diagram_model: str = ""
+
     # Retrieval
     top_k: int = 8
     chunk_tokens: int = 800
