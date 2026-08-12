@@ -8,3 +8,4 @@ docmind/data/
 build/
 dist/
 .DS_Store
+ .idea/*

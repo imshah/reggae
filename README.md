@@ -326,6 +326,113 @@ docmind config set confirm_threshold 0.25
 > `docmind add <path> --force`. Everything else (models, provider, `top_k`,
 > cost guard) takes effect on the next command.
 
+## Architecture
+
+> **Legend** — 🟢 **thick green** arrows = **ingestion path** (write); 🔵 **thin blue**
+> arrows = **retrieval / query path** (read); grey dotted = control, scoping & external calls.
+
+```mermaid
+flowchart TD
+    %% ===== nodes =====
+    subgraph UI["Interfaces"]
+        CLI["CLI + REPL<br/>cli.py"]
+        WEB["Web UI · Streamlit<br/>ui/app.py"]
+        HIST[("Chat history<br/>history.py")]
+    end
+    CFG["Config + .env<br/>config.py"]
+    ENG(["Engine — orchestration hub<br/>engine.py"])
+
+    DOCS[/"Documents<br/>pdf · docx · txt · md"/]
+    subgraph INGEST["Ingest (ingest/)"]
+        PARSE["parsers.py"]
+        VIS["diagrams.py<br/>vision describe"]
+        CHUNK["chunker.py"]
+    end
+
+    subgraph STORE["Storage (store/)"]
+        EMB["embeddings.py (qwen3)"]
+        VDB[("LanceDB<br/>vectordb.py")]
+        MAN[("manifest.json<br/>manifest.py")]
+    end
+
+    QN[/"Question / task"/]
+    subgraph TASKS["Retrieval + prompts (tasks/)"]
+        CTX["context.py<br/>cited context"]
+        BUILD["qa · gaps · diagram<br/>prompt builders"]
+    end
+
+    subgraph LLM["LLM layer (llm/)"]
+        PROV["provider.py<br/>get_provider · provider_for_model"]
+        LOCAL["local.py"]
+        CLAUDE["claude.py"]
+        KIMI["kimi.py"]
+        PRICE["pricing.py"]
+    end
+
+    subgraph EXT["Model runtimes"]
+        OLLAMA["Ollama (local)"]
+        ANTH["Anthropic API"]
+        MOON["Moonshot API"]
+    end
+    ANS(["Answer / diagram<br/>+ citations & cost"])
+
+    %% ===== control (grey) =====
+    CLI --> ENG
+    WEB --> ENG
+    WEB <--> HIST
+    CFG -.-> ENG
+
+    %% ===== INGESTION PATH (thick, green) =====
+    DOCS ==>|"① ingest"| ENG
+    ENG ==> PARSE
+    PARSE ==> VIS
+    VIS ==> CHUNK
+    PARSE ==> CHUNK
+    CHUNK ==> EMB
+    EMB ==>|write vectors| VDB
+    ENG ==>|register| MAN
+
+    %% ===== RETRIEVAL PATH (thin, blue) =====
+    QN -->|"② ask"| ENG
+    ENG -->|retrieve| EMB
+    EMB -->|embed query| VDB
+    MAN -.->|group scope| VDB
+    VDB -->|top-k hits| CTX
+    CTX --> BUILD
+    BUILD --> ENG
+    ENG --> PROV
+    PROV --> LOCAL
+    PROV --> CLAUDE
+    PROV --> KIMI
+    ENG -.->|cost guard| PRICE
+    LOCAL --> ANS
+    CLAUDE --> ANS
+    KIMI --> ANS
+    ANS --> WEB
+
+    %% ===== external runtimes (grey dotted) =====
+    VIS -.-> OLLAMA
+    EMB -.-> OLLAMA
+    LOCAL -.-> OLLAMA
+    CLAUDE -.-> ANTH
+    KIMI -.-> MOON
+
+    %% ===== styling =====
+    classDef ingest fill:#e8f5e9,stroke:#2e7d32,color:#1b5e20;
+    classDef query fill:#e3f2fd,stroke:#1565c0,color:#0d47a1;
+    class DOCS,PARSE,VIS,CHUNK ingest;
+    class QN,CTX,BUILD,ANS query;
+
+    %% ingestion links (indices 4-11) → green; retrieval links (12-27) → blue
+    linkStyle 4,5,6,7,8,9,10,11 stroke:#2e7d32,stroke-width:2.5px;
+    linkStyle 12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27 stroke:#1565c0,stroke-width:1.5px;
+```
+
+The **Engine** (`engine.py`) is the hub; the CLI/REPL and web UI are thin shells over it, and everything reads from one `Config`.
+
+- 🟢 **Ingestion path:** documents → `parsers` → optional `diagrams` (local vision) → `chunker` → `embeddings` (Ollama) → **LanceDB**, with each document registered in `manifest.json`.
+- 🔵 **Retrieval path:** the question is embedded and matched in **LanceDB** (scoped to the active group via the manifest); retrieved chunks are formatted by `context.py`, wrapped into a task prompt (`qa` / `gaps` / `diagram`), run on the model chosen for that task, and returned as a cited answer. The provider (`local` / `claude` / `kimi`) is inferred from the model id, and `pricing.py` enforces the cost guard on every remote call.
+
 ## How it works
 
 `ingest → parse → describe diagrams (local vision) → chunk → embed (Ollama) →
